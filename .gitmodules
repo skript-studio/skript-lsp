@@ -4,3 +4,6 @@
 [submodule "extensions/vscode-skript"]
 	path = extensions/vscode-skript
 	url = https://github.com/skript-studio/skript-studio-vscode.git
+[submodule "apps/skript-studio-ui"]
+	path = apps/skript-studio-ui
+	url = https://github.com/skript-studio/skript-studio.git
