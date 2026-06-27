@@ -1,0 +1,385 @@
+//! LSP `LanguageServer` implementation.
+//!
+//! Wires `tower-lsp` to `skript-core`. Every request handler degrades
+//! gracefully when [`AppState::ready`] is false: completions return empty,
+//! hover returns `None`, and diagnostics are deferred until data is loaded
+//! (and then re-published for every open document).
+//!
+//! LSP version: 3.17. We advertise only the capabilities we actually
+//! implement (completion, hover, diagnostics push, semanticTokens/full).
+
+use crate::options::InitOptions;
+use crate::state::AppState;
+use serde_json::Value;
+use skript_core::completion::{self, CompletionContext};
+use skript_core::hover;
+use skript_core::tokens::{self, SemanticType};
+use skript_core::validation::{self, Severity};
+use tower_lsp::jsonrpc::Result as RpcResult;
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionResponse, Diagnostic,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, Hover, HoverContents, HoverProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, InsertTextFormat, MarkupContent, MarkupKind, Position,
+    Range, SemanticToken, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
+    SemanticTokenType, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+};
+use tower_lsp::{Client, LanguageServer};
+
+/// Semantic-token legend advertised in server capabilities. Order matters:
+/// the integer token type ids returned in `SemanticTokens` index into this.
+const TOKEN_LEGEND: &[SemanticTokenType] = &[
+    SemanticTokenType::KEYWORD,
+    SemanticTokenType::TYPE,
+    SemanticTokenType::VARIABLE,
+    SemanticTokenType::STRING,
+    SemanticTokenType::COMMENT,
+    SemanticTokenType::OPERATOR,
+    SemanticTokenType::EVENT,
+    SemanticTokenType::FUNCTION,
+    SemanticTokenType::NUMBER,
+];
+
+/// Map a `skript_core::tokens::SemanticType` to its index in `TOKEN_LEGEND`.
+fn token_type_index(ty: SemanticType) -> u32 {
+    match ty {
+        SemanticType::Keyword => 0,
+        SemanticType::Type => 1,
+        SemanticType::Variable => 2,
+        SemanticType::String => 3,
+        SemanticType::Comment => 4,
+        SemanticType::Operator => 5,
+        SemanticType::Event => 6,
+        SemanticType::Function => 7,
+        SemanticType::Number => 8,
+    }
+}
+
+/// Per-session server instance. Cheap to clone (state is `Arc`-backed).
+pub struct Backend {
+    client: Client,
+    state: AppState,
+}
+
+impl Backend {
+    pub fn new(client: Client, state: AppState) -> Self {
+        Backend { client, state }
+    }
+
+    /// Apply `initializationOptions` on top of the existing effective config.
+    fn apply_init_options(&self, params: &InitializeParams) {
+        let Some(Value::Object(map)) = params.initialization_options.as_ref() else {
+            return;
+        };
+        let value = Value::Object(map.clone());
+        let Ok(opts) = serde_json::from_value::<InitOptions>(value) else {
+            tracing::warn!("initializationOptions present but failed to parse; ignoring");
+            return;
+        };
+        let mut cfg = self.state.config();
+        if let Some(max) = opts.max_completions {
+            cfg.max_completions = max;
+        }
+        self.state.set_config(cfg);
+    }
+
+    /// Re-validate every open document and publish fresh diagnostics.
+    /// Called after the index becomes ready and on every text change.
+    async fn publish_diagnostics_for_all(&self) {
+        if !self.state.ready() {
+            return;
+        }
+        // Collect URIs first to avoid holding a lock across the await.
+        let uris: Vec<String> = self.state.doc_uris();
+        for uri in uris {
+            self.publish_diagnostics(&uri).await;
+        }
+    }
+
+    async fn publish_diagnostics(&self, uri: &str) {
+        let Some(text) = self.state.get_doc(uri) else {
+            return;
+        };
+        let diags = self
+            .state
+            .with_index(|index, table| {
+                let lines: Vec<&str> = text.lines().collect();
+                validation::validate_document(&lines, index, table)
+                    .into_iter()
+            })
+            .map(|d| d.collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let lsp_diags: Vec<Diagnostic> = diags
+            .into_iter()
+            .map(|d| Diagnostic {
+                range: Range::new(
+                    Position::new(d.line, d.start_col),
+                    Position::new(d.line, d.end_col),
+                ),
+                severity: Some(severity_to_lsp(d.severity)),
+                source: Some(d.source),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(d.code)),
+                message: d.message,
+                ..Default::default()
+            })
+            .collect();
+
+        let parsed = uri.parse::<tower_lsp::lsp_types::Url>().ok();
+        let parsed = match parsed {
+            Some(u) => u,
+            None => {
+                tracing::warn!(uri = %uri, "could not parse document URI; skipping diagnostics");
+                return;
+            }
+        };
+        self.client
+            .publish_diagnostics(parsed, lsp_diags, None)
+            .await;
+    }
+}
+
+fn severity_to_lsp(s: Severity) -> DiagnosticSeverity {
+    match s {
+        Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+        Severity::Information => DiagnosticSeverity::INFORMATION,
+        Severity::Hint => DiagnosticSeverity::HINT,
+    }
+}
+
+#[tower_lsp::async_trait]
+impl LanguageServer for Backend {
+    async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
+        self.apply_init_options(&params);
+
+        let capabilities = ServerCapabilities {
+            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+            completion_provider: Some(tower_lsp::lsp_types::CompletionOptions {
+                resolve_provider: Some(false),
+                trigger_characters: Some(vec![" ".to_owned()]),
+                ..Default::default()
+            }),
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                SemanticTokensOptions {
+                    legend: SemanticTokensLegend {
+                        token_types: TOKEN_LEGEND.to_vec(),
+                        token_modifiers: vec![],
+                    },
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                    range: Some(false),
+                    ..Default::default()
+                },
+            )),
+            // Explicitly NOT advertising: definition, references, rename,
+            // formatting, code_action, signature_help.
+            ..Default::default()
+        };
+
+        Ok(InitializeResult {
+            capabilities,
+            server_info: Some(tower_lsp::lsp_types::ServerInfo {
+                name: "skript-lsp".to_owned(),
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            }),
+        })
+    }
+
+    async fn initialized(&self, _params: InitializedParams) {
+        tracing::info!("client initialized; loading embedded syntax data");
+        self.state.spawn_fetch();
+        // Once the index becomes ready, re-publish diagnostics for every
+        // already-open document (those opened before data loaded).
+        let backend = Backend {
+            client: self.client.clone(),
+            state: self.state.clone(),
+        };
+        tokio::spawn(async move {
+            // Poll readiness; cheap and bounded — readiness flips once.
+            for _ in 0..600 {
+                if backend.state.ready() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if backend.state.ready() {
+                backend.publish_diagnostics_for_all().await;
+            }
+        });
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri.to_string();
+        self.state
+            .open_doc(uri.clone(), params.text_document.text);
+        self.publish_diagnostics(&uri).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri.to_string();
+        // FULL sync: the last change in the notification is the whole document.
+        if let Some(change) = params.content_changes.into_iter().next() {
+            self.state.update_doc(&uri, change.text);
+        }
+        self.publish_diagnostics(&uri).await;
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri.to_string();
+        self.state.close_doc(&uri);
+    }
+
+    async fn completion(
+        &self,
+        params: tower_lsp::lsp_types::CompletionParams,
+    ) -> RpcResult<Option<CompletionResponse>> {
+        if !self.state.ready() {
+            return Ok(None);
+        }
+        let uri = params
+            .text_document_position
+            .text_document
+            .uri
+            .to_string();
+
+        let Some(text) = self.state.get_doc(&uri) else {
+            return Ok(None);
+        };
+        let pos = params.text_document_position.position;
+        let line_idx = pos.line as usize;
+        let lines: Vec<&str> = text.lines().collect();
+        let Some(line) = lines.get(line_idx) else {
+            return Ok(None);
+        };
+        // prefix = text on the line from column 0 up to the cursor
+        let char_idx = char_index_for_column(line, pos.character as usize);
+        let prefix = &line[..char_idx.min(line.len())];
+        let ctx = infer_context(line);
+
+        let max = self.state.config().max_completions;
+        let items = self
+            .state
+            .with_index(|_index, table| completion::completions(prefix, ctx, table, max))
+            .unwrap_or_default();
+
+        let lsp_items: Vec<CompletionItem> = items
+            .into_iter()
+            .map(|it| CompletionItem {
+                label: it.label,
+                kind: Some(CompletionItemKind::SNIPPET),
+                detail: Some(it.detail),
+                documentation: Some(tower_lsp::lsp_types::Documentation::String(it.documentation)),
+                insert_text: Some(it.insert_text),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                filter_text: Some(it.filter_text),
+                ..Default::default()
+            })
+            .collect();
+
+        Ok(Some(CompletionResponse::Array(lsp_items)))
+    }
+
+    async fn hover(
+        &self,
+        params: tower_lsp::lsp_types::HoverParams,
+    ) -> RpcResult<Option<Hover>> {
+        if !self.state.ready() {
+            return Ok(None);
+        }
+        let uri = params.text_document_position_params.text_document.uri.to_string();
+        let Some(text) = self.state.get_doc(&uri) else {
+            return Ok(None);
+        };
+        let pos = params.text_document_position_params.position;
+        let line_idx = pos.line as usize;
+        let lines: Vec<&str> = text.lines().collect();
+        let Some(line) = lines.get(line_idx) else {
+            return Ok(None);
+        };
+
+        let Some(info) = self
+            .state
+            .with_index(|index, table| hover::hover_at(line, pos.character, index, table))
+            .flatten()
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: info.markdown,
+            }),
+            range: Some(Range::new(
+                Position::new(pos.line, info.range.0),
+                Position::new(pos.line, info.range.1),
+            )),
+        }))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: tower_lsp::lsp_types::SemanticTokensParams,
+    ) -> RpcResult<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri.to_string();
+        let Some(text) = self.state.get_doc(&uri) else {
+            return Ok(None);
+        };
+        let toks = tokens::tokenize(&text);
+        let data = encode_semantic_tokens(&toks);
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
+    }
+
+    async fn shutdown(&self) -> RpcResult<()> {
+        tracing::info!("shutdown requested");
+        Ok(())
+    }
+}
+
+/// Convert an LSP column (UTF-16 code units) to a byte/char index into a
+/// Rust string slice. We treat the line as UTF-8 and count `char()`s, which
+/// matches LSP semantics when the document is ASCII (the common case for
+/// Skript). For non-ASCII this is a close-enough approximation.
+fn char_index_for_column(line: &str, column: usize) -> usize {
+    line.char_indices()
+        .nth(column)
+        .map(|(idx, _)| idx)
+        .unwrap_or_else(|| line.len())
+}
+
+/// Decide whether a line is at the top level (no indentation) of the file or
+/// inside an event/function/command body (indented).
+fn infer_context(line: &str) -> CompletionContext {
+    // Skript bodies are indented; top-level statements are flush-left.
+    if line.starts_with(char::is_whitespace) {
+        CompletionContext::Body
+    } else {
+        CompletionContext::TopLevel
+    }
+}
+
+/// Encode semantic tokens in the LSP relative-position delta format.
+fn encode_semantic_tokens(toks: &[skript_core::tokens::SemanticToken]) -> Vec<SemanticToken> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut prev_line = 0u32;
+    let mut prev_col = 0u32;
+    for t in toks {
+        let delta_line = t.line - prev_line;
+        let delta_col = if delta_line == 0 { t.col - prev_col } else { t.col };
+        out.push(SemanticToken {
+            delta_line,
+            delta_start: delta_col,
+            length: t.length,
+            token_type: token_type_index(t.ty),
+            token_modifiers_bitset: 0,
+        });
+        prev_line = t.line;
+        prev_col = t.col;
+    }
+    out
+}

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/skript-core",
+    "crates/skript-lsp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/skript-studio/skript-lsp"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[workspace.dependencies]
+# skript-core dependencies
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+regex = "1.11"
+tokio = { version = "1.45", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+url = "2.5"
+
+# skript-lsp dependencies
+tower-lsp = "0.20"
+dashmap = "6.1"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

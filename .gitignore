@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target
+**/target
+
+# Cargo lock — keep for binary crate, ignore for lib-only workspaces
+# (This repo ships a binary, so Cargo.lock IS committed.)
+
+# Editor / OS cruft
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+nul
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Local environment overrides
+.env
+.env.local
+
+# Logs and runtime artifacts
+*.log
+stderr.log
+stdout.log
+
+# SkriptHub cache (regenerable)
+skripthub-cache.json
+
+# Tauri sidecar binary (built by scripts/build-sidecar.ps1)
+apps/skript-studio-ui/src-tauri/skript-lsp-*.exe
